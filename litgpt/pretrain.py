@@ -161,6 +161,8 @@ def main(
 
     if train.tie_embeddings:
         model.transformer.wte.weight = model.lm_head.weight
+        if config.include_pos:
+            model.transformer.wpe.weight = model.pos_embed.weight
     if train.max_seq_length:
         model.max_seq_length = train.max_seq_length
 
@@ -190,6 +192,8 @@ def main(
         "train_dataloader": train_dataloader,
         "iter_num": 0,
         "step_count": 0,
+        "include_pos": config.include_pos,
+        "beta": config.beta
     }
 
     if resume is True:
@@ -222,6 +226,8 @@ def fit(
 ) -> None:
     model = state["model"]
     optimizer = state["optimizer"]
+    include_pos = state["include_pos"]
+    beta = state["beta"]
 
     validate(fabric, model, val_dataloader, max_iters=2)  # sanity check
     throughput = ThroughputMonitor(fabric, window_size=5)
@@ -229,8 +235,13 @@ def fit(
     with torch.device("meta"):
         meta_model = GPT(model.config)
         x = torch.randint(0, 1, (train.micro_batch_size, meta_model.max_seq_length))
-        model_fwd = lambda: meta_model(x)
-        model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
+        if include_pos:
+            pos = torch.randint(0, 1, (train.micro_batch_size, meta_model.max_seq_length))
+            model_fwd = lambda: meta_model(x, pos)
+            # model_loss = lambda (y,z): chunked_cross_entropy(y, x, chunk_size=0) TODO: fix this
+        else:
+            model_fwd = lambda: meta_model(x)
+            model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)
         fabric.print(f"Measured TFLOPs: {measured_flops * fabric.world_size / 1e12:.2f}")
         del meta_model, x
@@ -265,11 +276,20 @@ def fit(
 
         input_ids = train_data[:, 0 : model.max_seq_length].contiguous().long()
         targets = train_data[:, 1 : (model.max_seq_length + 1)].contiguous().long()
-
+        if include_pos:
+            pos_ids = train_data[:, 2 : model.max_seq_length].contiguous().long()
+            pos_targets = train_data[:, 3 : (model.max_seq_length + 1)].contiguous().long()
+            
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets)
+            if include_pos:
+                logits,pos_logits = model(input_ids, pos_ids)
+                lm_loss = chunked_cross_entropy(logits, targets)
+                pos_loss = chunked_cross_entropy(pos_logits, pos_targets)
+                loss = lm_loss + beta * pos_loss
+            else:
+                logits = model(input_ids)
+                loss = chunked_cross_entropy(logits, targets)
             fabric.backward(loss / train.gradient_accumulation_iters(devices))
 
         running_loss.update(loss.detach())

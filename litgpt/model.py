@@ -23,13 +23,26 @@ class GPT(nn.Module):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=config.lm_head_bias)
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+        
+        if self.config.include_pos:
+            self.pos_head = nn.Linear(config.n_embd, config.pos_vocab_size, bias=config.lm_head_bias) # Haris
+        
+            self.transformer = nn.ModuleDict(
+                dict(
+                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                    wpe=nn.Embedding(config.pos_vocab_size, config.n_embd), # Haris
+                    h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                )
             )
-        )
+        else:
+            self.transformer = nn.ModuleDict(
+                dict(
+                    wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
+                    h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+                    ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                )
+            )
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
 
@@ -70,7 +83,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor, pos_ids: Optional[torch.Tensor] = None, input_pos: Optional[torch.Tensor] = None) -> torch.Tensor:
         T = idx.size(1)
         if self.max_seq_length < T:
             raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
@@ -87,13 +100,25 @@ class GPT(nn.Module):
             mask = None
 
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        if self.config.scale_embeddings:
+        
+        if self.config.include_pos:
+            p = self.transformer.wpe(pos_ids)  # pos embeddings of shape (b, t, n_embd)
+            
+        if self.config.scale_embeddings: # TODO: Check if we want to scale POS Embeddings too or not
             x = x * (self.config.n_embd**0.5)
 
+        if self.config.include_pos:
+            x = x + p
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
         x = self.transformer.ln_f(x)
-        return self.lm_head(x)  # (b, t, vocab_size)
+        
+        lm_embed = self.lm_head(x)  # (b, t, vocab_size)
+        if self.config.include_pos:
+            pos_embed = self.pos_head(x)  # (b, t, pos_vocab_size)
+            return lm_embed, pos_embed
+        else:
+            return lm_embed
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:

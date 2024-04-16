@@ -22,6 +22,13 @@ class Config:
     vocab_size: int = 50254
     padding_multiple: int = 512
     padded_vocab_size: Optional[int] = None
+    # ---- POS Configuration ----
+    include_pos: False
+    pos_vocab_size: Optional[int] = None
+    pos_padding_multiple: int = 32 # TODO: Check if this is a good value
+    padded_pos_vocab_size: Optional[int] = None
+    beta: float = 0.1
+    # ---- POS Configuration ----
     n_layer: int = 16
     n_head: int = 32
     head_size: Optional[int] = None
@@ -76,6 +83,13 @@ class Config:
         else:
             # vocab size shouldn't be larger than padded vocab size
             self.vocab_size = min(self.vocab_size, self.padded_vocab_size)
+            
+        # pos_vocab_size should be a power of 2 to be optimal on hardware. compute the closest value
+        if self.padded_pos_vocab_size is None:
+            self.padded_pos_vocab_size = find_multiple(self.pos_vocab_size, self.pos_padding_multiple)
+        else:
+            # pos_vocab_size shouldn't be larger than padded pos vocab size
+            self.pos_vocab_size = min(self.pos_vocab_size, self.padded_pos_vocab_size)
 
         # compute the number of query groups
         if self.n_query_groups is not None:
